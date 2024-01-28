@@ -1,11 +1,14 @@
 import { Router } from 'itty-router'
 const { v4: uuid } = require('uuid')
 
-// Create a new router
 const router = Router()
+const headers = {
+	headers: {
+		'content-type': 'application/json;charset=UTF-8',
+	},
+}
 
-// Define the /game/start POST endpoint
-router.post('/game/start', async request => {
+router.post('/game/start', async (request, env) => {
 	const characters = 'abcdefghijklmnopqrstuvwxyz0123456789'
   let code = ''
   const charactersLength = characters.length
@@ -20,155 +23,173 @@ router.post('/game/start', async request => {
     code
   }, null, 2);
 
-  return new Response(json, {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  });
+	await env.DB.prepare(`INSERT INTO Game (gameId, code, status) VALUES (?1, ?2, 'NOT_STARTED')`).bind(gameId, code).run()
+
+  return new Response(json, headers)
 })
 
 // Define the /game/:code/join POST endpoint
-router.post('/game/:code/join', async request => {
-  const { code } = request.params;
-  const requestBody = await request.json();
-  const nickname = requestBody.nickname; // Assuming the JSON body has a 'nickname' property
+router.post('/game/:code/join', async (request, env) => {
+  const { code } = request.params
+  const requestBody = await request.json()
+  const nickname = requestBody.nickname // Assuming the JSON body has a 'nickname' property
 
+	const playerId = uuid()
+	const { gameId } = await env.DB.prepare(
+  	'SELECT gameId FROM Game WHERE code = ?'
+	).bind(code).first()
+
+	await env.DB.prepare(`INSERT INTO Player (playerId, nickname, gameId) VALUES (?1, ?2, ?3)`).bind(playerId, nickname, gameId).run();
   // Create a response object with gameId and a randomly generated playerId
   const response = {
-    playerId: '219371fe',
-    gameId: '11cef786'
+    playerId,
+    gameId
   }
 
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+  return new Response(JSON.stringify(response), headers)
 })
 
 // Define the /game/:gameId/round/start POST endpoint
-router.post('/game/:gameId/round/start', async request => {
+router.post('/game/:gameId/round/start', async (request, env) => {
   const { gameId } = request.params
+  let currentComedianId
+	try {
+		const requestBody = await request.json()
+  	currentComedianId = requestBody.currentComedianId
+	} catch {}
+
+	if (!currentComedianId) {
+		const stmt = env.DB.prepare('SELECT playerId FROM Player WHERE gameId = ?')
+		const { results } = await stmt.bind(gameId).all()
+		const randomIndex = Math.floor(Math.random() * results.length)
+    currentComedianId = results[randomIndex].playerId
+	}
+	const stmt2 = env.DB.prepare(`UPDATE Game SET status = 'IN_PROGRESS' WHERE gameId = ?`)
+	await stmt2.bind(gameId).run()
+
 
   // Create a response object with fixed roundId
+	const roundId = uuid()
+
+	await env.DB.prepare(`INSERT INTO Round (roundId, gameId, currentComedian) VALUES (?1, ?2, ?3)`).bind(roundId, gameId, currentComedianId).run()
+
+	const stmt = env.DB.prepare('UPDATE Game SET activeRound = ? WHERE gameId = ?')
+	await stmt.bind(roundId, gameId).run()
+
   const response = {
-    roundId: '1231fa'
+    roundId
   }
 
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+  return new Response(JSON.stringify(response), headers)
 })
 
-router.get('/game/:gameId', async request => {
+router.get('/game/:gameId', async (request, env) => {
   const { gameId } = request.params
+	// Prepare the statement to select game details and all associated players
+	const stmt = env.DB.prepare(`
+		SELECT
+			g.activeRound AS activeRoundId,
+			g.status AS gameStatus,
+			p.playerId,
+			p.nickname
+		FROM Game g
+		LEFT JOIN Player p ON g.gameId = p.gameId
+		WHERE g.gameId = ?
+	`);
 
-  // Sample response data
-  const response = {
-    activeRoundId: '123',
-    gameStatus: 'IN_PROGRESS',
-    players: [
-      { playerId: '219371fe', nickname: 'Oscar' },
-      { playerId: '66a71fe', nickname: 'Rod' }
-    ]
-  }
+	const { results } = await stmt.bind(gameId).all();
 
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+	const response = {
+		activeRoundId: results.length > 0 ? results[0].activeRoundId : null,
+		gameStatus: results.length > 0 ? results[0].gameStatus : null,
+		players: results.map(row => ({ playerId: row.playerId, nickname: row.nickname }))
+	};
+
+  return new Response(JSON.stringify(response), headers)
 })
 
-// Define the /game/:gameId/round/:roundId GET endpoint
-router.get('/game/:gameId/round/:roundId', async request => {
+router.get('/game/:gameId/round/:roundId', async (request, env) => {
   const { gameId, roundId } = request.params
 
-  // Sample response data
-  const response = {
-    aye: ['219371fe'],
-    nay: ['66a71fe'],
-    setup: null,
-    punchline: null
-  }
+	const stmt = env.DB.prepare(`
+		SELECT
+			r.setup,
+			r.punchline,
+			COUNT(CASE WHEN v.vote = 'Aye' THEN 1 END) AS ayeCount,
+			COUNT(CASE WHEN v.vote = 'Nay' THEN 1 END) AS nayCount,
+			r.currentComedian
+		FROM Round r
+		LEFT JOIN Vote v ON r.roundId = v.roundId
+		WHERE r.roundId = ?
+		GROUP BY r.roundId
+	`)
 
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+	const result = await stmt.bind(roundId).first()
+
+	// Construct the response object
+	const response = {
+		ayeCount: result.ayeCount,
+		nayCount: result.nayCount,
+		setup: result.setup,
+		punchline: result.punchline,
+		comedianId: result.currentComedian
+	}
+
+  return new Response(JSON.stringify(response), headers)
 })
 
 // Define the /game/:gameId/rounds GET endpoint
-router.get('/game/:gameId/rounds', async request => {
+router.get('/game/:gameId/rounds', async (request, env) => {
   const { gameId } = request.params
+	const stmt = env.DB.prepare(`
+		SELECT
+			r.roundId,
+			r.currentComedian AS comedianId,
+			COUNT(CASE WHEN v.vote = 'Aye' THEN 1 END) AS ayeCount,
+			COUNT(CASE WHEN v.vote = 'Nay' THEN 1 END) AS nayCount
+		FROM Round r
+		LEFT JOIN Vote v ON r.roundId = v.roundId
+		WHERE r.gameId = ?
+		GROUP BY r.roundId
+	`)
 
-  // Sample response data
-  const response = [
-    { roundId: '442', ayeCount: 1, nayCount: 1 },
-    { roundId: '123', ayeCount: 10, nayCount: 2 }
-  ]
+	// Execute the statement
+	const { results } = await stmt.bind(gameId).all()
 
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+	// Construct the response array
+	const response = results.map(round => ({
+		roundId: round.roundId,
+		ayeCount: round.ayeCount,
+		nayCount: round.nayCount,
+		comedianId: round.comedianId
+	}))
+
+  return new Response(JSON.stringify(response), headers)
 })
 
-// Define the /game/:gameId/round/:roundId/finish POST endpoint
-router.post('/game/:gameId/round/:roundId/finish', async request => {
-  const { gameId, roundId } = request.params
-
-  // Sample response data
-  const response = {
-    ayeCount: 1,
-    nayCount: 1
-  }
-
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
-})
-
-router.post('/game/:gameId/finish', async request => {
+router.post('/game/:gameId/finish', async (request, env) => {
   const { gameId } = request.params
+	const stmt = env.DB.prepare(`UPDATE Game SET status = 'FINISHED' WHERE gameId = ?`)
+	await stmt.bind(gameId).run()
 
-  // Sample response data
-  const response = [
-    { roundId: '442', ayeCount: 1, nayCount: 1 },
-    { roundId: '123', ayeCount: 10, nayCount: 2 }
-  ]
-
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+  return new Response(JSON.stringify({}), headers)
 })
 
-router.post('/game/:gameId/round/:roundId/player/:playerId/vote', async request => {
+router.post('/game/:gameId/round/:roundId/player/:playerId/vote', async (request, env) => {
   const { gameId, roundId, playerId } = request.params
   const requestBody = await request.json()
   const vote = requestBody.vote
 
-  // Implement logic here to handle the vote
-  // For example, record the vote in a database or another storage system
+	const stmt = env.DB.prepare(`INSERT INTO Vote (roundId, playerId, vote) VALUES (?1, ?2, ?3)`);
+	await stmt.bind(roundId, playerId, vote).run();
 
-  // Return an empty object
-  return new Response('{}', {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+  return new Response(JSON.stringify({
+		gameId, roundId, playerId
+	}), headers)
 })
 
 // Define the /game/:gameId/round/:roundId/player/:playerId/joke POST endpoint
-router.post('/game/:gameId/round/:roundId/player/:playerId/joke', async request => {
+router.post('/game/:gameId/round/:roundId/player/:playerId/joke', async (request, env) => {
   const { gameId, roundId, playerId } = request.params
   const requestBody = await request.json()
 
@@ -176,62 +197,83 @@ router.post('/game/:gameId/round/:roundId/player/:playerId/joke', async request 
   const setup = requestBody.setup
   const punchline = requestBody.punchline
 
-  // Implement logic here to handle the joke submission
-  // For example, store the joke in a database or process it further
+	const stmt = env.DB.prepare('UPDATE Round SET setup = ?, punchline = ? WHERE roundId = ?')
+	await stmt.bind(setup, punchline, roundId).run()
 
   // Assuming a successful operation, return an empty object
-  return new Response('{}', {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+  return new Response('{}', headers)
 })
 
 // Define the /game/:gameId/round/:roundId/player/:playerId GET endpoint
-router.get('/game/:gameId/round/:roundId/player/:playerId', async request => {
+router.get('/game/:gameId/round/:roundId/player/:playerId', async (request, env) => {
   const { gameId, roundId, playerId } = request.params
 
-  // Sample response data
-  const response = {
-    role: 'COMEDIAN',
-    setups: [
-      "Why don't eggs tell jokes?",
-      "How does a penguin build its house?",
-      "I'm reading a book on anti-gravity.",
-      "Did you hear about the mathematician who’s afraid of negative numbers?",
-      "Why don’t scientists trust atoms?",
-      "What do you call fake spaghetti?",
-      "How do you organize a space party?",
-      "Why couldn't the bicycle stand up by itself?",
-      "What did the janitor say when he jumped out of the closet?",
-      "What do you call cheese that isn't yours?"
-    ],
-    punchlines: [
-      "Because they might crack up.",
-      "Igloos it together.",
-      "It's impossible to put down.",
-      "He’ll stop at nothing to avoid them.",
-      "Because they make up everything.",
-      "An impasta.",
-      "You planet.",
-      "It was two tired.",
-      "Supplies!",
-      "Nacho cheese."
-    ]
-  }
+	const stmt = env.DB.prepare(`
+		SELECT
+			CASE
+				WHEN currentComedian = ? THEN 'YES'
+				ELSE 'NO'
+			END AS isComedian
+		FROM Round
+		WHERE roundId = ?
+	`);
 
-  return new Response(JSON.stringify(response), {
-    headers: {
-      'content-type': 'application/json;charset=UTF-8',
-    },
-  })
+	const result = await stmt.bind(playerId, roundId).first()
+	const isComedian = result && result.isComedian === 'YES'
+
+	let response
+	if (isComedian) {
+		const setupStmt = env.DB.prepare(`
+			SELECT text FROM Setup
+			ORDER BY RANDOM()
+			LIMIT 5
+		`);
+
+		const { results: setups } = await setupStmt.all();
+
+		const punchlineStmt = env.DB.prepare(`
+			SELECT text FROM Punchline
+			ORDER BY RANDOM()
+			LIMIT 5
+		`);
+
+		// Execute the punchline statement
+		const { results: punchlines } = await punchlineStmt.all();
+
+		// Construct the response object
+		response = {
+			role: 'COMEDIAN',
+			setups: setups.map(s => s.text),
+			punchlines: punchlines.map(p => p.text)
+		}
+  } else {
+		const stmt = env.DB.prepare(`
+			SELECT COUNT(*) AS voteCount
+				FROM Vote
+			WHERE roundId = ? AND playerId = ?
+		`);
+
+		// Execute the statement
+		const result = await stmt.bind(roundId, playerId).first();
+
+		// Check if the player has voted
+		const hasVoted = result.voteCount > 0;
+		response = {
+			role: 'AUDIENCE',
+			hasVoted
+		}
+	}
+
+  return new Response(JSON.stringify(response), headers)
 })
 
 
 // Fallback for all other GET requests
 router.all('*', () => new Response('Not Implemented', { status: 501 }))
 
-addEventListener('fetch', event => {
-  event.respondWith(router.handle(event.request))
-})
+export default {
+  async fetch(request, env, ctx) {
+    return router.handle(request, env, ctx)
+  },
+}
 
