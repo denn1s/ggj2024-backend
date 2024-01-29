@@ -1,15 +1,26 @@
 import { Router } from 'itty-router'
+import htmlContent from './html'
 const { v4: uuid } = require('uuid')
 
 const router = Router()
 const headers = {
 	headers: {
 		'content-type': 'application/json;charset=UTF-8',
+		'Access-Control-Allow-Origin': '*'
 	},
 }
 
+
+ router.get('/', () => {
+	return new Response(htmlContent, {
+    headers: {
+      'Content-Type': 'text/html',
+    },
+  })
+})
+
 router.post('/game/start', async (request, env) => {
-	const characters = 'abcdefghijklmnopqrstuvwxyz0123456789'
+	const characters = 'abcdefghijklmnopqrstuvwxyz123456789'
   let code = ''
   const charactersLength = characters.length
 	for (let i = 0; i < 4; i++) {
@@ -37,7 +48,11 @@ router.post('/game/:code/join', async (request, env) => {
 	const playerId = uuid()
 	const { gameId } = await env.DB.prepare(
   	'SELECT gameId FROM Game WHERE code = ?'
-	).bind(code).first()
+	).bind(code.toLowerCase()).first()
+
+	if (!gameId) {
+		return new Response(JSON.stringify({}), headers)
+	}
 
 	await env.DB.prepare(`INSERT INTO Player (playerId, nickname, gameId) VALUES (?1, ?2, ?3)`).bind(playerId, nickname, gameId).run();
   // Create a response object with gameId and a randomly generated playerId
@@ -67,8 +82,6 @@ router.post('/game/:gameId/round/start', async (request, env) => {
 	const stmt2 = env.DB.prepare(`UPDATE Game SET status = 'IN_PROGRESS' WHERE gameId = ?`)
 	await stmt2.bind(gameId).run()
 
-
-  // Create a response object with fixed roundId
 	const roundId = uuid()
 
 	await env.DB.prepare(`INSERT INTO Round (roundId, gameId, currentComedian) VALUES (?1, ?2, ?3)`).bind(roundId, gameId, currentComedianId).run()
@@ -130,8 +143,8 @@ router.get('/game/:gameId/round/:roundId', async (request, env) => {
 	const response = {
 		ayeCount: result.ayeCount,
 		nayCount: result.nayCount,
-		setup: result.setup,
-		punchline: result.punchline,
+		setup: result.setup || '',
+		punchline: result.punchline || '',
 		comedianId: result.currentComedian
 	}
 
@@ -169,10 +182,32 @@ router.get('/game/:gameId/rounds', async (request, env) => {
 
 router.post('/game/:gameId/finish', async (request, env) => {
   const { gameId } = request.params
-	const stmt = env.DB.prepare(`UPDATE Game SET status = 'FINISHED' WHERE gameId = ?`)
+	const stmt = env.DB.prepare(`UPDATE Game SET status = 'FINISHED', activeRound = NULL  WHERE gameId = ?`)
 	await stmt.bind(gameId).run()
+	const stmt2 = env.DB.prepare(`
+		SELECT
+			r.roundId,
+			r.currentComedian AS comedianId,
+			COUNT(CASE WHEN v.vote = 'Aye' THEN 1 END) AS ayeCount,
+			COUNT(CASE WHEN v.vote = 'Nay' THEN 1 END) AS nayCount
+		FROM Round r
+		LEFT JOIN Vote v ON r.roundId = v.roundId
+		WHERE r.gameId = ?
+		GROUP BY r.roundId
+	`)
 
-  return new Response(JSON.stringify({}), headers)
+	// Execute the statement
+	const { results } = await stmt2.bind(gameId).all()
+
+	// Construct the response array
+	const response = results.map(round => ({
+		roundId: round.roundId,
+		ayeCount: round.ayeCount,
+		nayCount: round.nayCount,
+		comedianId: round.comedianId
+	}))
+
+  return new Response(JSON.stringify(response), headers)
 })
 
 router.post('/game/:gameId/round/:roundId/player/:playerId/vote', async (request, env) => {
@@ -201,7 +236,9 @@ router.post('/game/:gameId/round/:roundId/player/:playerId/joke', async (request
 	await stmt.bind(setup, punchline, roundId).run()
 
   // Assuming a successful operation, return an empty object
-  return new Response('{}', headers)
+  return new Response(JSON.stringify({
+		setup, punchline
+	})  , headers)
 })
 
 // Define the /game/:gameId/round/:roundId/player/:playerId GET endpoint
@@ -213,13 +250,17 @@ router.get('/game/:gameId/round/:roundId/player/:playerId', async (request, env)
 			CASE
 				WHEN currentComedian = ? THEN 'YES'
 				ELSE 'NO'
-			END AS isComedian
+			END AS isComedian,
+			setup,
+			punchline
 		FROM Round
 		WHERE roundId = ?
 	`);
 
 	const result = await stmt.bind(playerId, roundId).first()
 	const isComedian = result && result.isComedian === 'YES'
+	const setup = result && result.setup
+	const punchline = result && result.punchline
 
 	let response
 	if (isComedian) {
@@ -260,7 +301,9 @@ router.get('/game/:gameId/round/:roundId/player/:playerId', async (request, env)
 		const hasVoted = result.voteCount > 0;
 		response = {
 			role: 'AUDIENCE',
-			hasVoted
+			hasVoted,
+			setup,
+			punchline
 		}
 	}
 
@@ -269,11 +312,26 @@ router.get('/game/:gameId/round/:roundId/player/:playerId', async (request, env)
 
 
 // Fallback for all other GET requests
-router.all('*', () => new Response('Not Implemented', { status: 501 }))
+// router.all('*', () => new Response('Not Implemented', { status: 501 }))
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*', // Adjust this to be more restrictive if necessary
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+}
+
+// Options Handler - Respond to preflight requests
+router.options('*', () => {
+  return new Response(null, {
+    headers: corsHeaders
+  })
+})
 
 export default {
   async fetch(request, env, ctx) {
-    return router.handle(request, env, ctx)
-  },
+		return router.handle(request, env, ctx).catch((e) => {
+						console.error('Error: ', e)
+							return new Response('{ "status": "Error" }', { ...headers, status: 500 })
+		})
+  }
 }
 
